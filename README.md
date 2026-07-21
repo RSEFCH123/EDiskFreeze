@@ -42,11 +42,11 @@
 
 **密码输入**
 
-![密码输入界面](https://raw.githubusercontent.com/RSEFCH123/EDiskFreeze/main/img/pwd.png)
+![密码输入界面](https://raw.githubusercontent.com/RSEFCH123/EDiskFreeze/main/img/pwd.PNG)
 
 **还原设置**
 
-![还原设置界面](https://raw.githubusercontent.com/RSEFCH123/EDiskFreeze/main/img/settings.png)
+![还原设置界面](https://raw.githubusercontent.com/RSEFCH123/EDiskFreeze/main/img/settings.PNG)
 
 ---
 

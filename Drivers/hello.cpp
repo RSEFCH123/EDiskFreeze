@@ -91,6 +91,7 @@ PDEVICE_OBJECT deviceObject = NULL;
 #define IOCTL_ESECURITY_SETPROTECTSTATUS CTL_CODE(FILE_DEVICE_UNKNOWN, 0xD52, METHOD_BUFFERED, FILE_ANY_ACCESS) //Set Protect Status
 #define IOCTL_EDISKPROTECT_SETPROTECTSECTORS CTL_CODE(FILE_DEVICE_UNKNOWN, 0xD53, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_ESECURITY_GETPROTECTSTATUS CTL_CODE(FILE_DEVICE_UNKNOWN, 0xD54, METHOD_BUFFERED, FILE_ANY_ACCESS) //
+#define IOCTL_EDISKPROTECT_GETPROTECTSECTORS CTL_CODE(FILE_DEVICE_UNKNOWN, 0xD55, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
 #define IOCTL_BUILDTEST CTL_CODE(FILE_DEVICE_UNKNOWN, 0xFFF, METHOD_BUFFERED, FILE_ANY_ACCESS) //Build Test
 
@@ -1326,7 +1327,7 @@ NTSTATUS WriteOriginalSectorEx(LARGE_INTEGER StartSector, ULONG SectorCount, PVO
 	LARGE_INTEGER ByteOffset;
 	ULONG Length = SectorCount * 512;
 	ByteOffset.QuadPart = StartSector.QuadPart * 512;
-	status = WriteOriginalSector(ByteOffset, Length, DataBuffer);
+	status = WriteOriginalSectorWriteThrough(ByteOffset, Length, DataBuffer);
 	return status;
 }
 
@@ -2794,13 +2795,14 @@ NTSTATUS DeviceIoctl(PDEVICE_OBJECT Device, PIRP pIrp)
 		return pIrp->IoStatus.Status;
 	}
 	if (Device != g_ControlDeviceObject) {
-		return g_OriginalDiskDeviceControl(Device, pIrp);
+		return DiskHook_DispatchDeviceControl(Device, pIrp);
 	}
 	if (funcCode < 0x800 || funcCode > 0xFFF)
 	{
 		return DiskHook_DispatchDeviceControl(Device,pIrp);
 	}
 	if (CODE != IOCTL_FORCEREADDISKBYPASSDISKHOOK &&
+		CODE != IOCTL_EDISKPROTECT_GETPROTECTSECTORS &&
 		CODE != IOCTL_SETPPL &&
 		CODE != IOCTL_PROTECTPROCESS) {
 		DbgPrint("password\n");
@@ -3132,7 +3134,16 @@ NTSTATUS DeviceIoctl(PDEVICE_OBJECT Device, PIRP pIrp)
 
 		LARGE_INTEGER startSector = *(PLARGE_INTEGER)inputBuffer;
 		LARGE_INTEGER sectorCount = *(PLARGE_INTEGER)(inputBuffer + 8);
-		ULONG dataLength = (ULONG)(sectorCount.QuadPart * 512);
+		if (startSector.QuadPart < 0 || sectorCount.QuadPart <= 0 ||
+			sectorCount.QuadPart > (MAXULONG / 512)) {
+			status = STATUS_INVALID_PARAMETER;
+			break;
+		}
+		ULONG dataLength = (ULONG)sectorCount.QuadPart * 512;
+		if (inputLength < 17 || inputLength - 17 < dataLength) {
+			status = STATUS_BUFFER_TOO_SMALL;
+			break;
+		}
 
 		// 关键修改：创建新的缓冲区副本
 		PVOID safeBuffer = ExAllocatePoolWithTag(NonPagedPoolNx, dataLength, 'mbr0');
@@ -3180,7 +3191,16 @@ NTSTATUS DeviceIoctl(PDEVICE_OBJECT Device, PIRP pIrp)
 
 		LARGE_INTEGER startSector = *(PLARGE_INTEGER)inputBuffer;
 		LARGE_INTEGER sectorCount = *(PLARGE_INTEGER)(inputBuffer + 8);
-		ULONG dataLength = (ULONG)(sectorCount.QuadPart * 512);
+		if (startSector.QuadPart < 0 || sectorCount.QuadPart <= 0 ||
+			sectorCount.QuadPart > (MAXULONG / 512)) {
+			status = STATUS_INVALID_PARAMETER;
+			break;
+		}
+		ULONG dataLength = (ULONG)sectorCount.QuadPart * 512;
+		if (inputLength - 17 < dataLength) {
+			status = STATUS_BUFFER_TOO_SMALL;
+			break;
+		}
 
 		// 关键修改：创建新的缓冲区副本
 		PVOID safeBuffer = ExAllocatePoolWithTag(NonPagedPoolNx, dataLength, 'mbr0');
@@ -3228,7 +3248,16 @@ NTSTATUS DeviceIoctl(PDEVICE_OBJECT Device, PIRP pIrp)
 
 		LARGE_INTEGER startSector = *(PLARGE_INTEGER)inputBuffer;
 		LARGE_INTEGER sectorCount = *(PLARGE_INTEGER)(inputBuffer + 8);
-		ULONG dataLength = (ULONG)(sectorCount.QuadPart * 512);
+		if (startSector.QuadPart < 0 || sectorCount.QuadPart <= 0 ||
+			sectorCount.QuadPart > (MAXULONG / 512)) {
+			status = STATUS_INVALID_PARAMETER;
+			break;
+		}
+		ULONG dataLength = (ULONG)sectorCount.QuadPart * 512;
+		if (inputLength - 17 < dataLength) {
+			status = STATUS_BUFFER_TOO_SMALL;
+			break;
+		}
 
 		// 关键修改：创建新的缓冲区副本
 		PVOID safeBuffer = ExAllocatePoolWithTag(NonPagedPoolNx, dataLength, 'mbr0');
@@ -4465,17 +4494,24 @@ NTSTATUS DeviceIoctl(PDEVICE_OBJECT Device, PIRP pIrp)
 	}
 	case IOCTL_EDISKPROTECT_SETPROTECTSECTORS:
 	{
-		PULONGLONG inputBuffer = (PULONGLONG)pIrp->AssociatedIrp.SystemBuffer;
-		if (pIrp->AssociatedIrp.SystemBuffer == NULL ||
-			irps->Parameters.DeviceIoControl.InputBufferLength < 16)
-		{
-			DbgPrint("[EFCHKMD] Invalid inputbuffer\n");
-			status = STATUS_INVALID_PARAMETER;
+		// Protection scope is loaded from the reserved on-disk metadata sector
+		// before the disk hooks are installed. Runtime changes would create an
+		// unprotected boot window and are intentionally rejected.
+		status = STATUS_NOT_SUPPORTED;
+		break;
+	}
+	case IOCTL_EDISKPROTECT_GETPROTECTSECTORS:
+	{
+		if (!pIrp->AssociatedIrp.SystemBuffer ||
+			irps->Parameters.DeviceIoControl.OutputBufferLength < sizeof(EDISK_PROTECTION_METADATA)) {
+			status = STATUS_BUFFER_TOO_SMALL;
 			break;
 		}
-		ULONGLONG startsector = inputBuffer[0];
-		ULONGLONG endsector = inputBuffer[1];
-		
+
+		status = DiskHook_GetProtectedRanges(
+			(PEDISK_PROTECTION_METADATA)pIrp->AssociatedIrp.SystemBuffer);
+		if (NT_SUCCESS(status))
+			info = sizeof(EDISK_PROTECTION_METADATA);
 		break;
 	}
 	case IOCTL_BUILDTEST:
@@ -4519,6 +4555,12 @@ NTSTATUS DispatchCreate(PDEVICE_OBJECT pDriverObj, PIRP pIrp)
 	else if (_stricmp((const char*)filename, "EDiskFreezeU") == 0 ||
 		_stricmp((const char*)filename, "EDiskFreezeU.exe") == 0 ||
 		_stricmp((const char*)filename, "EDiskFreezeU.e") == 0)
+	{
+		DbgPrint("[DispatchCreate] Allowed: %s\n", filename);
+	}
+	else if (_stricmp((const char*)filename, "PartRecMgr") == 0 ||
+		_stricmp((const char*)filename, "PartRecMgr.exe") == 0 ||
+		_stricmp((const char*)filename, "PartRecMgr.e") == 0)
 	{
 		DbgPrint("[DispatchCreate] Allowed: %s\n", filename);
 	}

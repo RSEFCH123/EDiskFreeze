@@ -30,6 +30,55 @@
 #define DISKHOOK_INTERNAL_IRP_FLAG 0x80000000UL
 #define DISKHOOK_INTERNAL_MAGIC ((PVOID)0xDEADBEEFDEADBEEFULL)
 
+// Protection ranges are absolute LBAs on Harddisk0. Runtime D53 changes are
+// rejected; the driver loads the complete range set before installing hooks.
+typedef struct _EDISK_PROTECTION_RANGE_ENTRY {
+    ULONGLONG StartSector;
+    ULONGLONG SectorCount;
+} EDISK_PROTECTION_RANGE_ENTRY, *PEDISK_PROTECTION_RANGE_ENTRY;
+
+#define EDISK_PROTECTION_METADATA_MAGIC 0x50444645UL
+#define EDISK_PROTECTION_METADATA_V1_VERSION 1UL
+#define EDISK_PROTECTION_METADATA_VERSION 2UL
+#define EDISK_PROTECTION_METADATA_ENABLED 0x00000001UL
+#define EDISK_MAX_PROTECTED_RANGES 30UL
+
+// Legacy one-range format. Version 2 is always written, but version 1 remains
+// readable so existing installations can be upgraded by the controller.
+typedef struct _EDISK_PROTECTION_METADATA_V1 {
+    ULONG Magic;
+    ULONG Version;
+    ULONG Size;
+    ULONG Flags;
+    ULONG DiskNumber;
+    ULONG Reserved;
+    ULONGLONG StartSector;
+    ULONGLONG SectorCount;
+    ULONG Checksum;
+    ULONG Reserved2;
+} EDISK_PROTECTION_METADATA_V1, *PEDISK_PROTECTION_METADATA_V1;
+
+// Version 2 occupies one complete 512-byte sector and stores up to 30
+// independent ranges. CRC-32 uses polynomial 0xEDB88320 and is computed over
+// all 512 bytes with Checksum treated as zero. RangeCount may be zero, which
+// explicitly means that no partition is protected.
+typedef struct _EDISK_PROTECTION_METADATA {
+    ULONG Magic;
+    ULONG Version;
+    ULONG Size;
+    ULONG Flags;
+    ULONG DiskNumber;
+    ULONG RangeCount;
+    ULONG Checksum;
+    ULONG Reserved;
+    EDISK_PROTECTION_RANGE_ENTRY Ranges[EDISK_MAX_PROTECTED_RANGES];
+} EDISK_PROTECTION_METADATA, *PEDISK_PROTECTION_METADATA;
+
+static_assert(sizeof(EDISK_PROTECTION_METADATA_V1) == 48,
+    "Unexpected version 1 metadata layout");
+static_assert(sizeof(EDISK_PROTECTION_METADATA) == 512,
+    "Version 2 protection metadata must occupy one sector");
+
 EXTERN_C NTSTATUS NTAPI ObReferenceObjectByName(IN PUNICODE_STRING ObjectName, IN ULONG64 Attributes, IN PACCESS_STATE PassedAccessState OPTIONAL, IN ACCESS_MASK DesiredAccess OPTIONAL, IN POBJECT_TYPE ObjectType, IN KPROCESSOR_MODE AccessMode, IN OUT PVOID ParseContext OPTIONAL, OUT PVOID* Object);
 
 typedef struct _COMMON_DEVICE_EXTENSION {
@@ -56,10 +105,8 @@ typedef struct _SECTOR_MAP_NODE {
 #define HASH_BUCKETS 4096
 typedef struct _SECTOR_CACHE {
     LIST_ENTRY      Buckets[HASH_BUCKETS];
-    RTL_BITMAP      Bitmap;
-    PULONG          BitmapBuffer;
     KSPIN_LOCK      Lock;
-    ULONG           TotalSectors;
+    ULONGLONG       TotalSectors;
     BOOLEAN         Initialized;
     ULONGLONG       DiffAreaStart;   // 差异区起始扇区（绝对LBA）
     ULONGLONG       DiffAreaTotal;   // 差异区总扇区数
@@ -89,7 +136,17 @@ NTSTATUS DiskHook_DispatchWrite(PDEVICE_OBJECT DeviceObject, PIRP Irp);
 //NTSTATUS DiskHook_DispatchPassThrough(PDEVICE_OBJECT DeviceObject, PIRP Irp);
 //NTSTATUS DiskHook_DispatchSCSI(PDEVICE_OBJECT DeviceObject, PIRP Irp);
 NTSTATUS DiskHook_DispatchDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp);
+NTSTATUS DiskHook_SetProtectedRanges(
+    ULONG DiskNumber,
+    ULONG RangeCount,
+    PEDISK_PROTECTION_RANGE_ENTRY Ranges);
+NTSTATUS DiskHook_GetProtectedRanges(
+    PEDISK_PROTECTION_METADATA Metadata);
 NTSTATUS WriteOriginalSector(
+    IN LARGE_INTEGER ByteOffset,
+    IN ULONG Length,
+    IN PVOID Buffer);
+NTSTATUS WriteOriginalSectorWriteThrough(
     IN LARGE_INTEGER ByteOffset,
     IN ULONG Length,
     IN PVOID Buffer);
@@ -108,3 +165,6 @@ extern PDEVICE_OBJECT  g_SystemDiskDevice;       // 系统盘设备对象
 extern PDRIVER_DISPATCH g_OriginalDiskRead;       // 原始 IRP_MJ_READ
 extern PDRIVER_DISPATCH g_OriginalDiskWrite;      // 原始 IRP_MJ_WRITE
 extern PDRIVER_DISPATCH g_OriginalDiskDeviceControl; // 原始 IOCTL 派遣
+
+extern ULONGLONG dh_startsector;
+extern ULONGLONG dh_endsector;
